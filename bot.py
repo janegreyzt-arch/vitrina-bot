@@ -1,204 +1,1160 @@
+from __future__ import annotations
+
 import asyncio
+import calendar
 import logging
-from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile
-import aiosqlite
-import re
 import os
-from dotenv import load_dotenv
-from rapidfuzz import process, fuzz
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import BaseFilter, Command
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from openpyxl import Workbook
-
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+from openpyxl.styles import Font, PatternFill
 
 # ====================== НАСТРОЙКИ ======================
+def load_env(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+load_env()
+TOKEN = (
+    os.environ.get("BOT_TOKEN")
+    or os.environ.get("TELEGRAM_BOT_TOKEN")
+    or os.environ.get("TOKEN")
+)
+if not TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не задан. Добавьте переменную BOT_TOKEN в .env или в панели хостинга"
+    )
+
+_work_chat_raw = os.environ.get("WORK_CHAT_ID", "-1003052957786")
+try:
+    WORK_CHAT_ID = int(_work_chat_raw)
+except ValueError as exc:
+    raise RuntimeError(
+        f"WORK_CHAT_ID должен быть числом, получено: {_work_chat_raw!r}"
+    ) from exc
+
+MSK = ZoneInfo("Europe/Moscow")
 POINTS = ["МН", "СМ", "Д1", "СОК", "ПТ", "ПК", "МСТИЛЬ"]
 TIMES = ["10:00", "16:00", "20:00"]
+SLOT_WINDOWS = {
+    "10:00": ("09:30", "10:30"),
+    "16:00": ("15:30", "16:30"),
+    "20:00": ("19:30", "20:30"),
+}
+SLOT_END = {slot: window[1] for slot, window in SLOT_WINDOWS.items()}
+NO_EVENING_POINTS = ["МСТИЛЬ", "СОК"]
+
 ADMIN_CODE = "1506"
-ADMIN_IDS = []   # список активных админов
+FINE_AMOUNT = 500
 
-# ====================== БАЗА ДАННЫХ ======================
-async def init_db():
+ARRIVAL_KEYWORDS = ("ПРИШЕЛ", "ПРИШЛА", "ПРИХОД", "НА ТОЧКЕ", "ЗАШЕЛ", "ЗАШЛА", "НАЧАЛ")
+DEPARTURE_KEYWORDS = ("ВЫШЕЛ", "ВЫШЛА", "УШЕЛ", "УШЛА", "ЗАКОНЧИЛ", "КОНЕЦ", "УХОД")
+
+MONTH_NAMES = [
+    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+
+# user_id -> {"dates": set[str], "year": int, "month": int}
+admin_sessions: dict[int, dict] = {}
+authenticated_admins: set[int] = set()
+
+# ====================== БОТ ======================
+bot = Bot(token=TOKEN, timeout=60)
+dp = Dispatcher()
+logger = logging.getLogger(__name__)
+
+# ====================== ВРЕМЯ (МСК) ======================
+def now_msk() -> datetime:
+    return datetime.now(MSK)
+
+
+def get_today() -> str:
+    return now_msk().strftime("%Y-%m-%d")
+
+
+def parse_date(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=MSK)
+
+
+def slots_for_point(point: str) -> list[str]:
+    if point in NO_EVENING_POINTS:
+        return [t for t in TIMES if t != "20:00"]
+    return TIMES
+
+
+def required_slots_for_date(date: str, point: str) -> list[str]:
+    return slots_for_point(point)
+
+
+def get_current_time_slot(now: datetime | None = None) -> str:
+    now = now or now_msk()
+    current = now.strftime("%H:%M")
+
+    for slot, (start, end) in SLOT_WINDOWS.items():
+        if start <= current <= end:
+            return slot
+
+    if current < SLOT_WINDOWS["10:00"][0]:
+        return "10:00"
+    if current < SLOT_WINDOWS["16:00"][0]:
+        return "10:00"
+    if current < SLOT_WINDOWS["20:00"][0]:
+        return "16:00"
+    return "20:00"
+
+
+def get_submission_status(time_slot: str, message_time: str) -> str:
+    start, end = SLOT_WINDOWS[time_slot]
+    if start <= message_time <= end:
+        return "on_time"
+    return "late"
+
+
+def parse_time_from_text(text_upper: str) -> str | None:
+    match = re.search(r"(\d{1,2})[:.](\d{2})", text_upper)
+    if match:
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+    for hour in ("10", "16", "20", "9", "11", "12", "13", "14", "15", "17", "18", "19", "21"):
+        if f" {hour} " in f" {text_upper} " or text_upper.endswith(f" {hour}"):
+            return f"{int(hour):02d}:00"
+    return None
+
+
+def find_point(text_upper: str) -> str | None:
+    """Точка как отдельное слово (не подстрока в другом тексте)."""
+    ordered = sorted(POINTS, key=len, reverse=True)
+    for point in ordered:
+        if re.search(
+            rf"(?:^|[\s,.:;!\-(]){re.escape(point.upper())}(?:[\s,.:;!\-)($]|$)",
+            text_upper,
+        ):
+            return point
+    return None
+
+
+def has_vitrina_keyword(text_upper: str) -> bool:
+    return bool(re.search(r"ВИТРИН", text_upper))
+
+
+def parse_vitrina_time_slot(text_upper: str) -> str | None:
+    """Время слота витрины: только 10:00, 16:00 или 20:00."""
+    match = re.search(r"(?:^|[\s,.:;!\-(])(10|16|20)(?:[:.]00)?(?:[\s,.:;!\-)($]|$)", text_upper)
+    if match:
+        return f"{match.group(1)}:00"
+    return None
+
+
+def normalize_caption(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^@\w+\s*", "", text)
+    return text.strip()
+
+
+def is_vitrina_format(text_upper: str, point: str) -> bool:
+    """
+    Допустимые форматы:
+    - МН 10:00 / МН 10
+    - МН витрина 10:00
+    Сообщение должно начинаться с кода точки.
+    """
+    compact = re.sub(r"\s+", " ", text_upper).strip()
+    prefix = point.upper()
+    if not compact.startswith(prefix):
+        return False
+
+    rest = compact[len(prefix):].strip()
+    time_part = r"(?:10|16|20)(?:[:.]00)?"
+
+    if re.fullmatch(time_part, rest):
+        return True
+    if re.match(rf"^ВИТРИН\w*\s+{time_part}$", rest):
+        return True
+    return False
+
+
+def week_dates(reference: datetime | None = None) -> list[str]:
+    ref = (reference or now_msk()).date()
+    monday = ref - timedelta(days=ref.weekday())
+    return [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+
+def format_period(dates: list[str]) -> str:
+    dates = sorted(dates)
+    if len(dates) == 1:
+        return dates[0]
+    return f"{dates[0]} — {dates[-1]} ({len(dates)} дн.)"
+
+
+# ====================== БАЗА ======================
+async def init_db() -> None:
     async with aiosqlite.connect("vitrina_bot.db") as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS vitrina_reports (
-            id INTEGER PRIMARY KEY, date TEXT, point TEXT, time_slot TEXT,
-            user_id INTEGER, username TEXT, message_time TEXT, status TEXT
-        )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS movements (
-            id INTEGER PRIMARY KEY, date TEXT, point TEXT, user_id INTEGER,
-            username TEXT, action TEXT, time TEXT
-        )""")
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS vitrina_reports (
+            id INTEGER PRIMARY KEY,
+            date TEXT,
+            point TEXT,
+            time_slot TEXT,
+            user_id INTEGER,
+            username TEXT,
+            message_time TEXT,
+            status TEXT,
+            has_photo INTEGER DEFAULT 0
+        )"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS shift_events (
+            id INTEGER PRIMARY KEY,
+            date TEXT,
+            point TEXT,
+            user_id INTEGER,
+            username TEXT,
+            event_type TEXT,
+            event_time TEXT,
+            UNIQUE(date, point, user_id, event_type)
+        )"""
+        )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS slot_notifications (
+            date TEXT,
+            time_slot TEXT,
+            PRIMARY KEY (date, time_slot)
+        )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reports_date ON vitrina_reports(date)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shifts_date ON shift_events(date)"
+        )
+        try:
+            await db.execute(
+                "ALTER TABLE vitrina_reports ADD COLUMN has_photo INTEGER DEFAULT 0"
+            )
+        except aiosqlite.OperationalError:
+            pass
         await db.commit()
 
-def get_today():
-    return datetime.now().strftime("%Y-%m-%d")
 
-def normalize_text(text: str) -> str:
-    return re.sub(r'[^а-яА-Я0-9:]', '', text.upper())
+async def fetch_reports_for_dates(dates: list[str]) -> dict[tuple[str, str, str], dict]:
+    if not dates:
+        return {}
+    placeholders = ",".join("?" * len(dates))
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT date, point, time_slot, username, message_time, status, has_photo
+                FROM vitrina_reports WHERE date IN ({placeholders})""",
+            dates,
+        )
+        rows = await cursor.fetchall()
+    return {(row["date"], row["point"], row["time_slot"]): dict(row) for row in rows}
 
-VITRINA_KEYWORDS = ["ВИТРИНА", "ВИТРИН", "ВИТР"]
-LEAVE_KEYWORDS = ["ВЫШЕЛ", "ВЫШЛА", "ОТОШЕЛ", "ОТОШЛА", "ПОЕХАЛ", "ПОЕХАЛА", "УШЕЛ", "УШЛА", "ВЫЕХАЛ"]
-RETURN_KEYWORDS = ["ВЕРНУЛСЯ", "ВЕРНУЛАСЬ", "ПРИЕХАЛ", "ПРИЕХАЛА", "ПРИБЫЛ", "ПРИБЫЛА"]
 
-# ====================== ОБРАБОТКА ======================
-@dp.message(F.chat.type.in_({"group", "supergroup"}))
-async def handle_message(message: Message):
-    if not message.text: return
-    text = message.text.strip()
-    norm_text = normalize_text(text)
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.full_name
-    msg_time = datetime.now()
+async def fetch_shifts_for_dates(dates: list[str]) -> list[dict]:
+    if not dates:
+        return []
+    placeholders = ",".join("?" * len(dates))
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""SELECT date, point, user_id, username, event_type, event_time
+                FROM shift_events WHERE date IN ({placeholders})
+                ORDER BY date, point, event_time""",
+            dates,
+        )
+        rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
 
-    if any(kw in norm_text for kw in VITRINA_KEYWORDS):
-        point_match = process.extractOne(norm_text, POINTS, scorer=fuzz.partial_ratio)
-        if point_match and point_match[1] >= 70:
-            point = point_match[0]
-            time_match = re.search(r'(\d{1,2})[:.]?(\d{2})?', text)
-            if time_match:
-                h = int(time_match.group(1))
-                m = int(time_match.group(2)) if time_match.group(2) else 0
-                time_slot = f"{h:02d}:{m:02d}"
-                if time_slot in TIMES:
-                    await save_vitrina(point, time_slot, user_id, username, msg_time)
-                    await bot.send_message(user_id, f"Витрина {point} на {time_slot} принята")
-                    return
 
-    action = None
-    if any(kw in norm_text for kw in LEAVE_KEYWORDS):
-        action = "leave"
-    elif any(kw in norm_text for kw in RETURN_KEYWORDS):
-        action = "return"
+async def is_slot_notified(date: str, time_slot: str) -> bool:
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM slot_notifications WHERE date=? AND time_slot=?",
+            (date, time_slot),
+        )
+        return await cursor.fetchone() is not None
 
-    if action:
-        point_match = process.extractOne(norm_text, POINTS, scorer=fuzz.partial_ratio)
-        if point_match and point_match[1] >= 65:
-            point = point_match[0]
-            await save_movement(point, action, user_id, username, msg_time)
-            status = "вышел" if action == "leave" else "вернулся"
-            await bot.send_message(user_id, f"{point} — {status}")
-            return
 
-# ====================== СОХРАНЕНИЕ ======================
-async def save_vitrina(point, time_slot, user_id, username, msg_time):
+async def mark_slot_notified(date: str, time_slot: str) -> None:
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO slot_notifications (date, time_slot) VALUES (?, ?)",
+            (date, time_slot),
+        )
+        await db.commit()
+
+
+# ====================== ПАРСЕР ======================
+def parse_shift_message(text: str) -> tuple[str | None, str | None, str | None]:
+    text_upper = normalize_caption(text).upper()
+    event = None
+    if any(k in text_upper for k in ARRIVAL_KEYWORDS):
+        event = "arrival"
+    elif any(k in text_upper for k in DEPARTURE_KEYWORDS):
+        event = "departure"
+    if not event:
+        return None, None, None
+
+    point = find_point(text_upper)
+    if not point:
+        return None, None, None
+
+    event_time = parse_time_from_text(text_upper) or now_msk().strftime("%H:%M")
+    return point, event, event_time
+
+
+def parse_vitrina_message(text: str) -> tuple[str | None, str | None]:
+    text_upper = normalize_caption(text).upper()
+    if not text_upper:
+        return None, None
+
+    if any(k in text_upper for k in ARRIVAL_KEYWORDS + DEPARTURE_KEYWORDS):
+        return None, None
+
+    point = find_point(text_upper)
+    if not point:
+        return None, None
+
+    time_slot = parse_vitrina_time_slot(text_upper)
+    if not time_slot:
+        return None, None
+
+    if not is_vitrina_format(text_upper, point):
+        return None, None
+
+    if time_slot == "20:00" and point in NO_EVENING_POINTS:
+        return point, None
+
+    return point, time_slot
+
+
+# ====================== СТАТИСТИКА ======================
+def count_required_reports(dates: list[str]) -> int:
+    total = 0
+    for date in dates:
+        for point in POINTS:
+            total += len(required_slots_for_date(date, point))
+    return total
+
+
+def compute_point_rating(
+    dates: list[str],
+    reports: dict[tuple[str, str, str], dict],
+) -> list[tuple[str, int]]:
+    misses: dict[str, int] = {p: 0 for p in POINTS}
+    for date in dates:
+        for point in POINTS:
+            for slot in required_slots_for_date(date, point):
+                report = reports.get((date, point, slot))
+                if not report or not report.get("has_photo"):
+                    misses[point] += 1
+    return sorted(misses.items(), key=lambda x: (-x[1], x[0]))
+
+
+def compute_fines(
+    dates: list[str],
+    reports: dict[tuple[str, str, str], dict],
+) -> int:
+    fines = 0
+    for date in dates:
+        for point in POINTS:
+            for slot in required_slots_for_date(date, point):
+                report = reports.get((date, point, slot))
+                if not report or not report.get("has_photo"):
+                    fines += FINE_AMOUNT
+                elif report.get("status") == "late":
+                    fines += FINE_AMOUNT
+    return fines
+
+
+def status_label(status: str) -> str:
+    return "✓ вовремя" if status == "on_time" else "⚠ опоздание"
+
+
+def format_vitrina_slot_line(slot: str, report: dict | None) -> str:
+    if report and report.get("has_photo"):
+        icon = "✅" if report["status"] == "on_time" else "⚠️"
+        st = "вовремя" if report["status"] == "on_time" else "опоздание"
+        return (
+            f"  • **{slot}** — {icon} {report['username']} "
+            f"({report['message_time']}, {st})"
+        )
+    return f"  • **{slot}** — ❌ нет фото"
+
+
+def build_vitrina_text_blocks(
+    dates: list[str],
+    reports: dict[tuple[str, str, str], dict],
+) -> list[str]:
+    blocks: list[str] = []
+    for date in dates:
+        blocks.append(f"\n📅 **{date}**")
+        point_blocks: list[str] = []
+        for point in POINTS:
+            slots = required_slots_for_date(date, point)
+            lines = [f"**Точка: {point}**"]
+            for slot in slots:
+                report = reports.get((date, point, slot))
+                lines.append(format_vitrina_slot_line(slot, report))
+            point_blocks.append("\n".join(lines))
+        blocks.append("\n\n".join(point_blocks))
+    return blocks
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in authenticated_admins
+
+
+def build_admin_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Отчёт")],
+            [KeyboardButton(text="📋 Статус сегодня")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_welcome_text() -> str:
+    return (
+        "🔐 **Админ-панель**\n\n"
+        "Выберите действие кнопкой ниже.\n"
+        "Отчёты приходят сюда, в личные сообщения."
+    )
+
+
+async def build_today_status_text() -> str:
     today = get_today()
-    expected = datetime.strptime(time_slot, "%H:%M").time()
-    delta = timedelta(minutes=30)
-    lower_time = (datetime.combine(datetime.today(), expected) - delta).time()
-    upper_time = (datetime.combine(datetime.today(), expected) + delta).time()
-    status = "on_time" if lower_time <= msg_time.time() <= upper_time else "late"
+    reports = await fetch_reports_for_dates([today])
+    lines = [f"📋 **Статус на сегодня** ({today})\n"]
+    point_blocks: list[str] = []
 
-    async with aiosqlite.connect("vitrina_bot.db") as db:
-        await db.execute("INSERT INTO vitrina_reports VALUES (NULL,?,?,?,?,?,?,?)",
-            (today, point, time_slot, user_id, username, msg_time.isoformat(), status))
-        await db.commit()
+    for point in POINTS:
+        block_lines = [f"**Точка: {point}**"]
+        for slot in required_slots_for_date(today, point):
+            report = reports.get((today, point, slot))
+            block_lines.append(format_vitrina_slot_line(slot, report))
+        point_blocks.append("\n".join(block_lines))
 
-async def save_movement(point, action, user_id, username, msg_time):
-    today = get_today()
-    async with aiosqlite.connect("vitrina_bot.db") as db:
-        await db.execute("INSERT INTO movements VALUES (NULL,?,?,?,?,?,?)",
-            (today, point, user_id, username, action, msg_time.strftime("%H:%M")))
-        await db.commit()
+    lines.append("\n\n".join(point_blocks))
+    return "\n".join(lines)
 
-# ====================== АДМИН КОМАНДЫ ======================
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    await bot.send_message(message.from_user.id, "Введите код доступа:")
 
-@dp.message(Command("admins"))
-async def cmd_admins(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    if not ADMIN_IDS:
-        await bot.send_message(message.from_user.id, "Список админов пуст.")
-        return
-    
-    text = "👥 Список админов:\n\n"
-    for uid in ADMIN_IDS:
-        text += f"• ID: {uid}\n"
-    await bot.send_message(message.from_user.id, text)
+async def send_report_calendar(message: Message, user_id: int) -> None:
+    session = get_admin_session(user_id)
+    session["dates"] = set()
+    await message.answer(
+        calendar_caption(session),
+        parse_mode="Markdown",
+        reply_markup=build_calendar(session["year"], session["month"], session["dates"]),
+    )
 
-@dp.message()
-async def handle_admin_code(message: Message):
-    global ADMIN_IDS
-    if message.text and message.text.strip() == ADMIN_CODE:
-        user_id = message.from_user.id
-        if user_id not in ADMIN_IDS:
-            ADMIN_IDS.append(user_id)
-            await bot.send_message(user_id, 
-                "✅ Доступ разрешён!\n\n"
-                "Команды:\n"
-                "/report_vitrina [дата]\n"
-                "/report_movement [дата]\n"
-                "/admins — посмотреть список админов")
+
+# ====================== КАЛЕНДАРЬ ======================
+def get_admin_session(user_id: int) -> dict:
+    if user_id not in admin_sessions:
+        now = now_msk()
+        admin_sessions[user_id] = {
+            "dates": set(),
+            "year": now.year,
+            "month": now.month,
+        }
+    return admin_sessions[user_id]
+
+
+def build_calendar(
+    year: int,
+    month: int,
+    selected: set[str] | None = None,
+) -> InlineKeyboardMarkup:
+    selected = selected or set()
+    today = now_msk().date()
+    cal = calendar.Calendar(firstweekday=0)
+    weeks = cal.monthdayscalendar(year, month)
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=f"◀ {MONTH_NAMES[month - 1] if month > 1 else MONTH_NAMES[12]}",
+                callback_data=f"cal:prev:{year}:{month}",
+            ),
+            InlineKeyboardButton(
+                text=f"{MONTH_NAMES[month]} {year}",
+                callback_data="cal:noop",
+            ),
+            InlineKeyboardButton(
+                text=f"{MONTH_NAMES[month + 1] if month < 12 else MONTH_NAMES[1]} ▶",
+                callback_data=f"cal:next:{year}:{month}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(text="Пн", callback_data="cal:noop"),
+            InlineKeyboardButton(text="Вт", callback_data="cal:noop"),
+            InlineKeyboardButton(text="Ср", callback_data="cal:noop"),
+            InlineKeyboardButton(text="Чт", callback_data="cal:noop"),
+            InlineKeyboardButton(text="Пт", callback_data="cal:noop"),
+            InlineKeyboardButton(text="Сб", callback_data="cal:noop"),
+            InlineKeyboardButton(text="Вс", callback_data="cal:noop"),
+        ],
+    ]
+
+    for week in weeks:
+        row: list[InlineKeyboardButton] = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="cal:noop"))
+                continue
+            date_str = f"{year:04d}-{month:02d}-{day:02d}"
+            label = str(day)
+            if date_str in selected:
+                label = f"✓{day}"
+            elif year == today.year and month == today.month and day == today.day:
+                label = f"•{day}•"
+            row.append(
+                InlineKeyboardButton(text=label, callback_data=f"cal:toggle:{date_str}")
+            )
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(text="📅 Неделя", callback_data="cal:week"),
+        InlineKeyboardButton(text="🗑 Сброс", callback_data="cal:clear"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="✅ Готово", callback_data="cal:done"),
+        InlineKeyboardButton(text="◀ Меню", callback_data="adm:menu"),
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def build_format_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Excel", callback_data="cal:fmt:xlsx"),
+            InlineKeyboardButton(text="📝 Текст", callback_data="cal:fmt:txt"),
+        ],
+    ])
+
+
+def calendar_caption(session: dict) -> str:
+    dates = sorted(session["dates"])
+    if dates:
+        dates_text = f"Выбрано: {format_period(dates)}"
+    else:
+        dates_text = "Нажмите на даты (можно несколько) или «📅 Неделя»"
+    return (
+        "📅 **Выбор дат для отчёта**\n\n"
+        f"{dates_text}\n\n"
+        "Отчёт включает:\n"
+        "• витрины (фото)\n"
+        "• выходы сотрудников (приход/уход)\n"
+        "• рейтинг точек по пропускам"
+    )
+
+
+# ====================== ОТЧЁТЫ ======================
+def build_text_report(
+    dates: list[str],
+    reports: dict[tuple[str, str, str], dict],
+    shifts: list[dict],
+) -> list[str]:
+    dates = sorted(dates)
+    rating = compute_point_rating(dates, reports)
+    fines = compute_fines(dates, reports)
+    chunks: list[str] = []
+
+    header = (
+        f"📊 **ОТЧЁТ** {format_period(dates)}\n"
+        f"Штрафы: {fines} руб.\n"
+        f"{'=' * 30}"
+    )
+    chunks.append(header)
+
+    rating_lines = ["\n🏆 **РЕЙТИНГ ТОЧЕК** (пропуски фото):"]
+    if any(count for _, count in rating):
+        for i, (point, count) in enumerate(rating, 1):
+            if count:
+                rating_lines.append(f"{i}. **{point}** — {count} пропуск(ов)")
+    else:
+        rating_lines.append("Пропусков нет ✓")
+    chunks.append("\n".join(rating_lines))
+
+    vitrina_header = "\n📸 **ВИТРИНЫ**"
+    chunks.append(vitrina_header)
+    chunks.extend(build_vitrina_text_blocks(dates, reports))
+
+    shift_lines = ["\n👥 **ВЫХОДЫ СОТРУДНИКОВ**:"]
+    day_shifts = {d: [s for s in shifts if s["date"] == d] for d in dates}
+    has_shifts = False
+    for date in dates:
+        events = day_shifts.get(date, [])
+        if not events:
+            continue
+        has_shifts = True
+        shift_lines.append(f"\n📅 {date}:")
+        by_point: dict[str, list[dict]] = {}
+        for ev in events:
+            by_point.setdefault(ev["point"], []).append(ev)
+        for point in POINTS:
+            if point not in by_point:
+                continue
+            arrivals = [e for e in by_point[point] if e["event_type"] == "arrival"]
+            departures = [e for e in by_point[point] if e["event_type"] == "departure"]
+            for arr in arrivals:
+                dep = next(
+                    (d for d in departures if d["user_id"] == arr["user_id"]),
+                    None,
+                )
+                dep_text = f", вышел {dep['event_time']}" if dep else ""
+                shift_lines.append(
+                    f"  {point}: {arr['username']} — "
+                    f"пришёл {arr['event_time']}{dep_text}"
+                )
+            for dep in departures:
+                if not any(a["user_id"] == dep["user_id"] for a in arrivals):
+                    shift_lines.append(
+                        f"  {point}: {dep['username']} — вышел {dep['event_time']}"
+                    )
+    if not has_shifts:
+        shift_lines.append("Нет данных о выходах")
+    chunks.append("\n".join(shift_lines))
+
+    return split_text_chunks(chunks)
+
+
+def split_text_chunks(parts: list[str], limit: int = 4000) -> list[str]:
+    messages: list[str] = []
+    current = ""
+    for part in parts:
+        if len(current) + len(part) + 1 > limit and current:
+            messages.append(current.strip())
+            current = part
         else:
-            await bot.send_message(user_id, "Вы уже имеете доступ.")
+            current = f"{current}\n{part}" if current else part
+    if current.strip():
+        messages.append(current.strip())
+    return messages or ["Нет данных за выбранный период."]
 
-# ====================== ОТЧЕТЫ (без изменений) ======================
-async def generate_vitrina_excel(date: str):
+
+async def generate_report_xlsx(
+    dates: list[str],
+    reports: dict[tuple[str, str, str], dict],
+    shifts: list[dict],
+) -> str:
+    dates = sorted(dates)
+    rating = compute_point_rating(dates, reports)
+    fines = compute_fines(dates, reports)
+
     wb = Workbook()
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    missing_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    late_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+
+    # --- Лист: витрины ---
     ws = wb.active
     ws.title = "Витрины"
-    ws.append(["Точка", "Запланировано", "Статус", "Сотрудник", "Время отправки"])
+    ws.append(["Период:", format_period(dates)])
+    ws.append(["Штрафы:", fines, "руб."])
+    ws.append([])
 
-    async with aiosqlite.connect("vitrina_bot.db") as db:
-        async with db.execute("SELECT point, time_slot, status, username, message_time FROM vitrina_reports WHERE date = ? ORDER BY point, time_slot", (date,)) as cursor:
-            rows = await cursor.fetchall()
-            for row in rows:
-                status_text = "Вовремя" if row[2] == "on_time" else "Опоздание"
-                ws.append([row[0], row[1], status_text, row[3], row[4][:16]])
+    header = ["Дата", "Точка"]
+    for slot in TIMES:
+        header.extend([f"{slot} — сотрудник", f"{slot} — время", f"{slot} — статус"])
+    ws.append(header)
+    for cell in ws[4]:
+        cell.fill = header_fill
+        cell.font = header_font
 
-    filename = f"Витрины_{date}.xlsx"
+    for date in dates:
+        for point in POINTS:
+            row = [date, point]
+            for slot in TIMES:
+                if slot == "20:00" and point in NO_EVENING_POINTS:
+                    row.extend(["—", "—", "не требуется"])
+                    continue
+                report = reports.get((date, point, slot))
+                if report and report.get("has_photo"):
+                    row.extend([
+                        report["username"],
+                        report["message_time"],
+                        status_label(report["status"]),
+                    ])
+                else:
+                    row.extend(["—", "—", "нет фото"])
+            ws.append(row)
+            row_idx = ws.max_row
+            for col_idx, value in enumerate(row[2:], start=3):
+                if value == "нет фото":
+                    ws.cell(row=row_idx, column=col_idx).fill = missing_fill
+                elif value == "⚠ опоздание":
+                    ws.cell(row=row_idx, column=col_idx).fill = late_fill
+
+    # --- Лист: выходы ---
+    ws2 = wb.create_sheet("Выходы")
+    ws2.append(["Дата", "Точка", "Сотрудник", "Пришёл", "Вышел"])
+    for cell in ws2[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for date in dates:
+        day_events = [s for s in shifts if s["date"] == date]
+        by_point: dict[str, list[dict]] = {}
+        for ev in day_events:
+            by_point.setdefault(ev["point"], []).append(ev)
+        for point in POINTS:
+            for ev in by_point.get(point, []):
+                if ev["event_type"] != "arrival":
+                    continue
+                dep = next(
+                    (
+                        d for d in by_point[point]
+                        if d["event_type"] == "departure"
+                        and d["user_id"] == ev["user_id"]
+                    ),
+                    None,
+                )
+                ws2.append([
+                    date, point, ev["username"],
+                    ev["event_time"],
+                    dep["event_time"] if dep else "—",
+                ])
+
+    # --- Лист: рейтинг ---
+    ws3 = wb.create_sheet("Рейтинг")
+    ws3.append(["Место", "Точка", "Пропусков фото"])
+    for cell in ws3[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+    for i, (point, count) in enumerate(rating, 1):
+        ws3.append([i, point, count])
+
+    for sheet in (ws, ws2, ws3):
+        for col in sheet.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            sheet.column_dimensions[col[0].column_letter].width = min(max_len + 2, 30)
+
+    period = dates[0] if len(dates) == 1 else f"{dates[0]}_{dates[-1]}"
+    filename = f"report_{period}.xlsx"
     wb.save(filename)
     return filename
 
-async def generate_movement_excel(date: str):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Выходы и возвраты"
-    ws.append(["Точка", "Действие", "Время", "Сотрудник"])
+
+# ====================== УВЕДОМЛЕНИЯ ======================
+async def check_missed_vitrinas() -> None:
+    now = now_msk()
+    today = now.strftime("%Y-%m-%d")
+    current = now.strftime("%H:%M")
+
+    for slot, end_time in SLOT_END.items():
+        if current <= end_time:
+            continue
+        if await is_slot_notified(today, slot):
+            continue
+
+        reports = await fetch_reports_for_dates([today])
+        missed: list[str] = []
+        for point in POINTS:
+            if slot == "20:00" and point in NO_EVENING_POINTS:
+                continue
+            report = reports.get((today, point, slot))
+            if not report or not report.get("has_photo"):
+                missed.append(point)
+
+        if missed:
+            points_text = ", ".join(f"**{p}**" for p in missed)
+            text = (
+                f"⚠️ **Пропущены витрины** ({slot}, {today}):\n"
+                f"{points_text}\n\n"
+                f"Штраф: {FINE_AMOUNT} руб. за каждую точку"
+            )
+            try:
+                await bot.send_message(WORK_CHAT_ID, text, parse_mode="Markdown")
+            except Exception:
+                logger.exception(
+                    "Не удалось отправить уведомление в чат %s", WORK_CHAT_ID
+                )
+
+        await mark_slot_notified(today, slot)
+
+
+async def notification_scheduler() -> None:
+    while True:
+        try:
+            await check_missed_vitrinas()
+        except Exception:
+            logger.exception("Ошибка в планировщике уведомлений")
+        await asyncio.sleep(60)
+
+
+# ====================== ОБРАБОТКА: РАБОЧИЙ ЧАТ ======================
+class WorkChatFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return message.chat.id == WORK_CHAT_ID
+
+
+@dp.message(
+    WorkChatFilter(),
+    (F.text & ~F.text.startswith("/")) | (F.caption & ~F.caption.startswith("/")),
+)
+async def handle_work_chat_message(message: Message):
+    text = (message.text or message.caption or "").strip()
+    if not text or text.split()[0] == ADMIN_CODE:
+        return
+
+    has_photo = bool(message.photo)
+
+    point, event, event_time = parse_shift_message(text)
+    if point and event:
+        user_id = message.from_user.id
+        username = message.from_user.username or message.from_user.full_name
+        date = get_today()
+        async with aiosqlite.connect("vitrina_bot.db") as db:
+            await db.execute(
+                """INSERT INTO shift_events
+                   (date, point, user_id, username, event_type, event_time)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(date, point, user_id, event_type)
+                   DO UPDATE SET event_time=excluded.event_time,
+                                 username=excluded.username""",
+                (date, point, user_id, username, event, event_time),
+            )
+            await db.commit()
+
+        verb = "приход" if event == "arrival" else "уход"
+        await message.reply(
+            f"✅ **{point}** — {verb} зафиксирован ({event_time})",
+            parse_mode="Markdown",
+        )
+        return
+
+    point, time_slot = parse_vitrina_message(text)
+    if not point:
+        return
+
+    if time_slot is None:
+        await message.reply(
+            f"Точка **{point}** не сдаёт вечерний отчёт (20:00).",
+            parse_mode="Markdown",
+        )
+        return
+
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.full_name
+    date = get_today()
+    message_time = now_msk().strftime("%H:%M")
+    status = get_submission_status(time_slot, message_time)
 
     async with aiosqlite.connect("vitrina_bot.db") as db:
-        async with db.execute("SELECT point, action, time, username FROM movements WHERE date = ? ORDER BY time", (date,)) as cursor:
-            rows = await cursor.fetchall()
-            for row in rows:
-                action_text = "Вышел" if row[1] == "leave" else "Вернулся"
-                ws.append([row[0], action_text, row[2], row[3]])
+        await db.execute(
+            "DELETE FROM vitrina_reports WHERE date=? AND point=? AND time_slot=?",
+            (date, point, time_slot),
+        )
+        await db.execute(
+            """INSERT INTO vitrina_reports
+               (date, point, time_slot, user_id, username, message_time, status, has_photo)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (date, point, time_slot, user_id, username, message_time, status, int(has_photo)),
+        )
+        await db.commit()
 
-    filename = f"Движения_{date}.xlsx"
-    wb.save(filename)
-    return filename
+    if not has_photo:
+        await message.reply(
+            f"⚠️ **{point}** — витрина на {time_slot} принята, "
+            f"но **нет фото**. Отправьте фото для зачёта.",
+            parse_mode="Markdown",
+        )
+        return
 
-@dp.message(Command("report_vitrina"))
-async def report_vitrina(message: Message):
-    if message.from_user.id not in ADMIN_IDS: return
-    date = message.text.split()[-1] if len(message.text.split()) > 1 else get_today()
-    if not re.match(r"\d{4}-\d{2}-\d{2}", date):
-        date = get_today()
-    filename = await generate_vitrina_excel(date)
-    await bot.send_document(message.from_user.id, FSInputFile(filename), caption=f"Отчет по витринам за {date}")
+    status_text = "принята вовремя" if status == "on_time" else "принята с опозданием ⚠"
+    await message.reply(
+        f"✅ **{point}** — витрина на {time_slot} {status_text}",
+        parse_mode="Markdown",
+    )
 
-@dp.message(Command("report_movement"))
-async def report_movement(message: Message):
-    if message.from_user.id not in ADMIN_IDS: return
-    date = message.text.split()[-1] if len(message.text.split()) > 1 else get_today()
-    if not re.match(r"\d{4}-\d{2}-\d{2}", date):
-        date = get_today()
-    filename = await generate_movement_excel(date)
-    await bot.send_document(message.from_user.id, FSInputFile(filename), caption=f"Отчет по движениям за {date}")
+
+# ====================== КОМАНДЫ ======================
+@dp.message(Command("chatid", "chat_id", "чатайди"))
+async def cmd_chatid(message: Message):
+    chat = message.chat
+    type_names = {
+        "private": "личные сообщения",
+        "group": "группа",
+        "supergroup": "супергруппа",
+        "channel": "канал",
+    }
+    type_name = type_names.get(chat.type, chat.type)
+    title = chat.title or chat.full_name or "—"
+
+    text = (
+        f"**ID чата:** `{chat.id}`\n"
+        f"**Тип:** {type_name}\n"
+        f"**Название:** {title}"
+    )
+    if chat.type in ("group", "supergroup"):
+        match = "✅ Это рабочий чат бота" if chat.id == WORK_CHAT_ID else "⚠️ Это не рабочий чат бота"
+        text += f"\n\n{match}\n\nДобавьте в `.env`:\n`WORK_CHAT_ID={chat.id}`"
+
+    await message.reply(text, parse_mode="Markdown")
+
+
+# ====================== ОБРАБОТКА: ЛС АДМИН ======================
+@dp.message(Command("start"), F.chat.type == "private")
+async def cmd_start(message: Message):
+    if is_admin(message.from_user.id):
+        await message.answer(
+            admin_welcome_text(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_keyboard(),
+        )
+        return
+    await message.answer(
+        "👋 Бот учёта витрин.\n\n"
+        "Сотрудники отправляют фото и выходы с точек в **групповом чате**.\n\n"
+        "Для доступа к админ-панели введите код.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(F.chat.type == "private", F.text)
+async def handle_private_message(message: Message):
+    text = (message.text or "").strip()
+    user_id = message.from_user.id
+
+    if text.startswith("/"):
+        return
+
+    if text == ADMIN_CODE:
+        authenticated_admins.add(user_id)
+        await message.answer(
+            "✅ Доступ открыт!\n\n" + admin_welcome_text(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_keyboard(),
+        )
+        return
+
+    if not is_admin(user_id):
+        await message.answer("🔒 Введите код администратора для доступа к панели.")
+        return
+
+    if text == "📊 Отчёт":
+        await send_report_calendar(message, user_id)
+        return
+
+    if text == "📋 Статус сегодня":
+        await message.answer(
+            await build_today_status_text(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "Используйте кнопки ниже 👇",
+        reply_markup=build_admin_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:"))
+async def handle_admin_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Сначала введите код в ЛС боту", show_alert=True)
+        return
+
+    if callback.data.split(":")[1] == "menu":
+        try:
+            await callback.message.edit_text(admin_welcome_text(), parse_mode="Markdown")
+        except Exception:
+            pass
+        await callback.message.answer(
+            "Выберите действие:",
+            reply_markup=build_admin_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cal:"))
+async def handle_calendar(callback: CallbackQuery):
+    if callback.message.chat.type != "private" or not is_admin(callback.from_user.id):
+        await callback.answer("Доступ только для админов в ЛС", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    action = parts[1]
+    user_id = callback.from_user.id
+    session = get_admin_session(user_id)
+
+    if action == "noop":
+        await callback.answer()
+        return
+
+    if action in ("prev", "next"):
+        year, month = int(parts[2]), int(parts[3])
+        if action == "prev":
+            month -= 1
+            if month < 1:
+                month, year = 12, year - 1
+        else:
+            month += 1
+            if month > 12:
+                month, year = 1, year + 1
+        session["year"], session["month"] = year, month
+        await callback.message.edit_text(
+            calendar_caption(session),
+            parse_mode="Markdown",
+            reply_markup=build_calendar(year, month, session["dates"]),
+        )
+        await callback.answer()
+        return
+
+    if action == "toggle":
+        date = parts[2]
+        if date in session["dates"]:
+            session["dates"].remove(date)
+        else:
+            session["dates"].add(date)
+        await callback.message.edit_text(
+            calendar_caption(session),
+            parse_mode="Markdown",
+            reply_markup=build_calendar(
+                session["year"], session["month"], session["dates"]
+            ),
+        )
+        await callback.answer()
+        return
+
+    if action == "week":
+        session["dates"].update(week_dates())
+        await callback.message.edit_text(
+            calendar_caption(session),
+            parse_mode="Markdown",
+            reply_markup=build_calendar(
+                session["year"], session["month"], session["dates"]
+            ),
+        )
+        await callback.answer("Выбрана текущая неделя")
+        return
+
+    if action == "clear":
+        session["dates"].clear()
+        await callback.message.edit_text(
+            calendar_caption(session),
+            parse_mode="Markdown",
+            reply_markup=build_calendar(
+                session["year"], session["month"], session["dates"]
+            ),
+        )
+        await callback.answer("Выбор сброшен")
+        return
+
+    if action == "done":
+        if not session["dates"]:
+            await callback.answer("Выберите хотя бы одну дату", show_alert=True)
+            return
+        await callback.message.edit_text(
+            f"📋 Период: **{format_period(sorted(session['dates']))}**\n\n"
+            "Выберите формат отчёта:",
+            parse_mode="Markdown",
+            reply_markup=build_format_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    if action == "fmt":
+        fmt = parts[2]
+        dates = sorted(session["dates"])
+        await callback.answer("Формирую отчёт...")
+        await callback.message.edit_text(
+            f"⏳ Формирую отчёт ({format_period(dates)})..."
+        )
+
+        reports = await fetch_reports_for_dates(dates)
+        shifts = await fetch_shifts_for_dates(dates)
+
+        if fmt == "xlsx":
+            filename = await generate_report_xlsx(dates, reports, shifts)
+            await callback.message.answer_document(
+                FSInputFile(filename),
+                caption=f"📊 Отчёт за {format_period(dates)}",
+            )
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+        else:
+            for chunk in build_text_report(dates, reports, shifts):
+                await callback.message.answer(chunk, parse_mode="Markdown")
+
+        session["dates"] = set()
+        try:
+            await callback.message.edit_text(
+                admin_welcome_text(),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        await callback.message.answer(
+            "Отчёт готов. Выберите следующее действие:",
+            reply_markup=build_admin_keyboard(),
+        )
+        return
+
+    await callback.answer()
+
 
 # ====================== ЗАПУСК ======================
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
+
 async def main():
+    setup_logging()
+    print("=== VITRINA BOT: старт ===", flush=True)
+    print(f"=== TOKEN: {'задан' if TOKEN else 'НЕТ'} ===", flush=True)
+    print(f"=== WORK_CHAT_ID: {WORK_CHAT_ID} ===", flush=True)
+
     await init_db()
-    logging.basicConfig(level=logging.INFO)
-    print("✅ Бот успешно запущен на Bothost!")
+    logger.info("Бот запущен. Слоты (МСК): %s", ", ".join(TIMES))
+    logger.info("Рабочий чат: chat_id=%s", WORK_CHAT_ID)
+    print("=== VITRINA BOT: polling... ===", flush=True)
+
+    asyncio.create_task(notification_scheduler())
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        print("=== VITRINA BOT: ОШИБКА ЗАПУСКА ===", flush=True)
+        logging.exception("Критическая ошибка при запуске")
+        raise
