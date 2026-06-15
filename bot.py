@@ -244,6 +244,13 @@ async def init_db() -> None:
         )"""
         )
         await db.execute(
+            """CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            added_at TEXT
+        )"""
+        )
+        await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_reports_date ON vitrina_reports(date)"
         )
         await db.execute(
@@ -305,6 +312,44 @@ async def mark_slot_notified(date: str, time_slot: str) -> None:
             (date, time_slot),
         )
         await db.commit()
+
+
+async def load_admins() -> set[int]:
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        cursor = await db.execute("SELECT user_id FROM admins")
+        rows = await cursor.fetchall()
+    return {row[0] for row in rows}
+
+
+async def save_admin(user_id: int, username: str | None) -> None:
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        await db.execute(
+            """INSERT INTO admins (user_id, username, added_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET username=excluded.username""",
+            (user_id, username or "", now_msk().strftime("%Y-%m-%d %H:%M")),
+        )
+        await db.commit()
+
+
+async def fetch_admin_ids() -> list[int]:
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        cursor = await db.execute("SELECT user_id FROM admins")
+        rows = await cursor.fetchall()
+    return [row[0] for row in rows]
+
+
+async def notify_admins(text: str) -> None:
+    admin_ids = await fetch_admin_ids()
+    if not admin_ids:
+        logger.warning("Пропуски витрин есть, но админов нет — некому отправить уведомление")
+        return
+
+    for user_id in admin_ids:
+        try:
+            await bot.send_message(user_id, text, parse_mode="Markdown")
+        except Exception:
+            logger.exception("Не удалось отправить уведомление админу %s", user_id)
 
 
 # ====================== ПАРСЕР ======================
@@ -588,7 +633,7 @@ def build_text_report(
 
     header = (
         f"📊 **ОТЧЁТ** {format_period(dates)}\n"
-        f"Штрафы: {fines} руб.\n"
+        f"Депремия: {fines} руб.\n"
         f"{'=' * 30}"
     )
     chunks.append(header)
@@ -678,7 +723,7 @@ async def generate_report_xlsx(
     ws = wb.active
     ws.title = "Витрины"
     ws.append(["Период:", format_period(dates)])
-    ws.append(["Штрафы:", fines, "руб."])
+    ws.append(["Депремия:", fines, "руб."])
     ws.append([])
 
     header = ["Дата", "Точка"]
@@ -789,14 +834,9 @@ async def check_missed_vitrinas() -> None:
             text = (
                 f"⚠️ **Пропущены витрины** ({slot}, {today}):\n"
                 f"{points_text}\n\n"
-                f"Штраф: {FINE_AMOUNT} руб. за каждую точку"
+                f"Депремия: {FINE_AMOUNT} руб. за каждую точку"
             )
-            try:
-                await bot.send_message(WORK_CHAT_ID, text, parse_mode="Markdown")
-            except Exception:
-                logger.exception(
-                    "Не удалось отправить уведомление в чат %s", WORK_CHAT_ID
-                )
+            await notify_admins(text)
 
         await mark_slot_notified(today, slot)
 
@@ -948,9 +988,13 @@ async def handle_private_message(message: Message):
         return
 
     if text == ADMIN_CODE:
+        username = message.from_user.username or message.from_user.full_name
         authenticated_admins.add(user_id)
+        await save_admin(user_id, username)
         await message.answer(
-            "✅ Доступ открыт!\n\n" + admin_welcome_text(),
+            "✅ Доступ открыт!\n\n"
+            + admin_welcome_text()
+            + "\n\n_Вы будете получать уведомления о пропусках витрин в ЛС._",
             parse_mode="Markdown",
             reply_markup=build_admin_keyboard(),
         )
@@ -1143,6 +1187,8 @@ async def main():
     print(f"=== WORK_CHAT_ID: {WORK_CHAT_ID} ===", flush=True)
 
     await init_db()
+    authenticated_admins.update(await load_admins())
+    logger.info("Админов в базе: %d", len(authenticated_admins))
     logger.info("Бот запущен. Слоты (МСК): %s", ", ".join(TIMES))
     logger.info("Рабочий чат: chat_id=%s", WORK_CHAT_ID)
     print("=== VITRINA BOT: polling... ===", flush=True)
