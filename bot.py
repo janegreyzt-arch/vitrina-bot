@@ -69,8 +69,14 @@ NO_EVENING_POINTS = ["МСТИЛЬ", "СОК"]
 ADMIN_CODE = "1506"
 FINE_AMOUNT = 500
 
-ARRIVAL_KEYWORDS = ("ПРИШЕЛ", "ПРИШЛА", "ПРИХОД", "НА ТОЧКЕ", "ЗАШЕЛ", "ЗАШЛА", "НАЧАЛ")
-DEPARTURE_KEYWORDS = ("ВЫШЕЛ", "ВЫШЛА", "УШЕЛ", "УШЛА", "ЗАКОНЧИЛ", "КОНЕЦ", "УХОД")
+ARRIVAL_KEYWORDS = (
+    "ПРИШЕЛ", "ПРИШЛА", "ПРИХОД", "ПРИБЫЛ", "ПРИБЫЛА",
+    "НА ТОЧКЕ", "ЗАШЕЛ", "ЗАШЛА", "НАЧАЛ", "НА РАБОТЕ",
+)
+DEPARTURE_KEYWORDS = (
+    "ВЫШЕЛ", "ВЫШЛА", "УШЕЛ", "УШЛА", "ЗАКОНЧИЛ", "КОНЕЦ", "УХОД",
+    "ВЫХОД", "С ТОЧКИ", "СО СМЕНЫ", "СМЕНА ЗАКОНЧ",
+)
 
 MONTH_NAMES = [
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -339,17 +345,67 @@ async def fetch_admin_ids() -> list[int]:
     return [row[0] for row in rows]
 
 
+async def send_admin_dm(user_id: int, text: str, **kwargs) -> None:
+    """Уведомления только в ЛС. В рабочую группу не отправляем."""
+    if user_id == WORK_CHAT_ID or user_id < 0:
+        logger.warning("Пропущена отправка в чат %s (не ЛС админа)", user_id)
+        return
+    await bot.send_message(user_id, text, **kwargs)
+
+
 async def notify_admins(text: str) -> None:
     admin_ids = await fetch_admin_ids()
     if not admin_ids:
-        logger.warning("Пропуски витрин есть, но админов нет — некому отправить уведомление")
+        logger.warning("Некому отправить уведомление — нет админов в базе")
         return
 
     for user_id in admin_ids:
         try:
-            await bot.send_message(user_id, text, parse_mode="Markdown")
+            await send_admin_dm(user_id, text, parse_mode="Markdown")
         except Exception:
             logger.exception("Не удалось отправить уведомление админу %s", user_id)
+
+
+async def notify_admins_shift(
+    point: str,
+    event: str,
+    event_time: str,
+    username: str,
+) -> None:
+    verb = "Приход" if event == "arrival" else "Уход"
+    text = (
+        f"👥 **{verb} на точке {point}**\n"
+        f"Сотрудник: {username}\n"
+        f"Время: {event_time}\n"
+        f"Дата: {get_today()}"
+    )
+    await notify_admins(text)
+
+
+async def notify_admins_vitrina(
+    point: str,
+    time_slot: str,
+    username: str,
+    message_time: str,
+    status: str,
+    has_photo: bool,
+) -> None:
+    if not has_photo:
+        text = (
+            f"⚠️ **Витрина {point}** ({time_slot})\n"
+            f"Сотрудник: {username}\n"
+            f"Время: {message_time}\n"
+            f"Статус: нет фото"
+        )
+    else:
+        st = "вовремя" if status == "on_time" else "опоздание"
+        text = (
+            f"📸 **Витрина {point}** ({time_slot})\n"
+            f"Сотрудник: {username}\n"
+            f"Время: {message_time}\n"
+            f"Статус: {st}"
+        )
+    await notify_admins(text)
 
 
 # ====================== ПАРСЕР ======================
@@ -369,6 +425,76 @@ def parse_shift_message(text: str) -> tuple[str | None, str | None, str | None]:
 
     event_time = parse_time_from_text(text_upper) or now_msk().strftime("%H:%M")
     return point, event, event_time
+
+
+def collect_shift_rows(
+    dates: list[str],
+    shifts: list[dict],
+) -> list[tuple[str, str, str, str | None, str | None]]:
+    """date, point, username, arrival_time, departure_time"""
+    rows: list[tuple[str, str, str, str | None, str | None]] = []
+    for date in sorted(dates):
+        day_events = [s for s in shifts if s["date"] == date]
+        by_point: dict[str, list[dict]] = {}
+        for ev in day_events:
+            by_point.setdefault(ev["point"], []).append(ev)
+
+        for point in POINTS:
+            events = by_point.get(point, [])
+            if not events:
+                continue
+            user_ids = {e["user_id"] for e in events}
+            for user_id in user_ids:
+                arrival = next(
+                    (e for e in events if e["user_id"] == user_id and e["event_type"] == "arrival"),
+                    None,
+                )
+                departure = next(
+                    (e for e in events if e["user_id"] == user_id and e["event_type"] == "departure"),
+                    None,
+                )
+                username = (arrival or departure)["username"]
+                rows.append((
+                    date,
+                    point,
+                    username,
+                    arrival["event_time"] if arrival else None,
+                    departure["event_time"] if departure else None,
+                ))
+    return rows
+
+
+def build_shift_text_blocks(
+    dates: list[str],
+    shifts: list[dict],
+) -> list[str]:
+    rows = collect_shift_rows(dates, shifts)
+    if not rows:
+        return ["\n👥 **ВЫХОДЫ СОТРУДНИКОВ**\n\nНет данных о выходах"]
+
+    blocks = ["\n👥 **ВЫХОДЫ СОТРУДНИКОВ**"]
+    by_date: dict[str, list[tuple[str, str, str, str | None, str | None]]] = {}
+    for row in rows:
+        by_date.setdefault(row[0], []).append(row)
+
+    for date in sorted(by_date.keys()):
+        blocks.append(f"\n📅 **{date}**")
+        date_rows = by_date[date]
+        for point in POINTS:
+            point_rows = [r for r in date_rows if r[1] == point]
+            if not point_rows:
+                continue
+            lines = [f"**Точка: {point}**"]
+            for _, _, username, arr_time, dep_time in point_rows:
+                if arr_time and dep_time:
+                    lines.append(f"  • {username} — пришёл {arr_time}, вышел {dep_time}")
+                elif arr_time:
+                    lines.append(f"  • {username} — пришёл {arr_time}")
+                elif dep_time:
+                    lines.append(f"  • {username} — вышел {dep_time}")
+            blocks.append("\n".join(lines))
+
+    return blocks
 
 
 def parse_vitrina_message(text: str) -> tuple[str | None, str | None]:
@@ -650,42 +776,7 @@ def build_text_report(
     vitrina_header = "\n📸 **ВИТРИНЫ**"
     chunks.append(vitrina_header)
     chunks.extend(build_vitrina_text_blocks(dates, reports))
-
-    shift_lines = ["\n👥 **ВЫХОДЫ СОТРУДНИКОВ**:"]
-    day_shifts = {d: [s for s in shifts if s["date"] == d] for d in dates}
-    has_shifts = False
-    for date in dates:
-        events = day_shifts.get(date, [])
-        if not events:
-            continue
-        has_shifts = True
-        shift_lines.append(f"\n📅 {date}:")
-        by_point: dict[str, list[dict]] = {}
-        for ev in events:
-            by_point.setdefault(ev["point"], []).append(ev)
-        for point in POINTS:
-            if point not in by_point:
-                continue
-            arrivals = [e for e in by_point[point] if e["event_type"] == "arrival"]
-            departures = [e for e in by_point[point] if e["event_type"] == "departure"]
-            for arr in arrivals:
-                dep = next(
-                    (d for d in departures if d["user_id"] == arr["user_id"]),
-                    None,
-                )
-                dep_text = f", вышел {dep['event_time']}" if dep else ""
-                shift_lines.append(
-                    f"  {point}: {arr['username']} — "
-                    f"пришёл {arr['event_time']}{dep_text}"
-                )
-            for dep in departures:
-                if not any(a["user_id"] == dep["user_id"] for a in arrivals):
-                    shift_lines.append(
-                        f"  {point}: {dep['username']} — вышел {dep['event_time']}"
-                    )
-    if not has_shifts:
-        shift_lines.append("Нет данных о выходах")
-    chunks.append("\n".join(shift_lines))
+    chunks.extend(build_shift_text_blocks(dates, shifts))
 
     return split_text_chunks(chunks)
 
@@ -765,28 +856,17 @@ async def generate_report_xlsx(
         cell.fill = header_fill
         cell.font = header_font
 
-    for date in dates:
-        day_events = [s for s in shifts if s["date"] == date]
-        by_point: dict[str, list[dict]] = {}
-        for ev in day_events:
-            by_point.setdefault(ev["point"], []).append(ev)
-        for point in POINTS:
-            for ev in by_point.get(point, []):
-                if ev["event_type"] != "arrival":
-                    continue
-                dep = next(
-                    (
-                        d for d in by_point[point]
-                        if d["event_type"] == "departure"
-                        and d["user_id"] == ev["user_id"]
-                    ),
-                    None,
-                )
-                ws2.append([
-                    date, point, ev["username"],
-                    ev["event_time"],
-                    dep["event_time"] if dep else "—",
-                ])
+    for date, point, username, arr_time, dep_time in collect_shift_rows(dates, shifts):
+        ws2.append([
+            date,
+            point,
+            username,
+            arr_time or "—",
+            dep_time or "—",
+        ])
+
+    if ws2.max_row == 1:
+        ws2.append(["—", "—", "Нет данных", "—", "—"])
 
     # --- Лист: рейтинг ---
     ws3 = wb.create_sheet("Рейтинг")
@@ -808,7 +888,7 @@ async def generate_report_xlsx(
     return filename
 
 
-# ====================== УВЕДОМЛЕНИЯ ======================
+# ====================== УВЕДОМЛЕНИЯ (только ЛС админам, не в группу) ======================
 async def check_missed_vitrinas() -> None:
     now = now_msk()
     today = now.strftime("%Y-%m-%d")
@@ -884,11 +964,11 @@ async def handle_work_chat_message(message: Message):
             )
             await db.commit()
 
-        verb = "приход" if event == "arrival" else "уход"
-        await message.reply(
-            f"✅ **{point}** — {verb} зафиксирован ({event_time})",
-            parse_mode="Markdown",
+        logger.info(
+            "Выход: %s %s %s (%s) user=%s",
+            date, point, event, event_time, user_id,
         )
+        await notify_admins_shift(point, event, event_time, username)
         return
 
     point, time_slot = parse_vitrina_message(text)
@@ -896,10 +976,7 @@ async def handle_work_chat_message(message: Message):
         return
 
     if time_slot is None:
-        await message.reply(
-            f"Точка **{point}** не сдаёт вечерний отчёт (20:00).",
-            parse_mode="Markdown",
-        )
+        logger.info("Вечерняя витрина отклонена: %s", point)
         return
 
     user_id = message.from_user.id
@@ -921,24 +998,21 @@ async def handle_work_chat_message(message: Message):
         )
         await db.commit()
 
-    if not has_photo:
-        await message.reply(
-            f"⚠️ **{point}** — витрина на {time_slot} принята, "
-            f"но **нет фото**. Отправьте фото для зачёта.",
-            parse_mode="Markdown",
-        )
-        return
-
-    status_text = "принята вовремя" if status == "on_time" else "принята с опозданием ⚠"
-    await message.reply(
-        f"✅ **{point}** — витрина на {time_slot} {status_text}",
-        parse_mode="Markdown",
+    logger.info(
+        "Витрина: %s %s %s photo=%s user=%s",
+        date, point, time_slot, has_photo, user_id,
+    )
+    await notify_admins_vitrina(
+        point, time_slot, username, message_time, status, has_photo,
     )
 
 
 # ====================== КОМАНДЫ ======================
 @dp.message(Command("chatid", "chat_id", "чатайди"))
 async def cmd_chatid(message: Message):
+    if message.chat.id == WORK_CHAT_ID:
+        return
+
     chat = message.chat
     type_names = {
         "private": "личные сообщения",
