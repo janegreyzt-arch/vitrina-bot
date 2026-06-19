@@ -5,6 +5,7 @@ import calendar
 import logging
 import os
 import re
+import shutil
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -54,6 +55,13 @@ except ValueError as exc:
     raise RuntimeError(
         f"WORK_CHAT_ID должен быть числом, получено: {_work_chat_raw!r}"
     ) from exc
+
+# На bothost данные в ./data сохраняются между redeploy (см. bothost.ru/docs).
+DB_DIR = os.environ.get("DB_DIR", "data")
+DB_PATH = os.environ.get("DATABASE_PATH") or os.path.join(DB_DIR, "vitrina_bot.db")
+BACKUP_DIR = os.path.join(DB_DIR, "backups")
+LEGACY_DB_PATH = "vitrina_bot.db"
+BACKUP_KEEP_LOCAL = 14
 
 MSK = ZoneInfo("Europe/Moscow")
 POINTS = ["МН", "СМ", "Д1", "СОК", "ПТ", "ПК", "МСТИЛЬ"]
@@ -219,8 +227,163 @@ def format_period(dates: list[str]) -> str:
 
 
 # ====================== БАЗА ======================
+def setup_db_location() -> None:
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+async def import_legacy_db_if_needed() -> None:
+    legacy = os.path.abspath(LEGACY_DB_PATH)
+    target = os.path.abspath(DB_PATH)
+    if legacy == target or not os.path.isfile(legacy):
+        return
+    if os.path.isfile(target):
+        async with aiosqlite.connect(target) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM vitrina_reports")
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return
+    shutil.copy2(legacy, target)
+    logger.info("База перенесена: %s -> %s", LEGACY_DB_PATH, DB_PATH)
+
+
+async def fetch_db_summary() -> str:
+    if not os.path.isfile(DB_PATH):
+        return "База ещё не создана."
+
+    size_kb = os.path.getsize(DB_PATH) // 1024
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT date, COUNT(*) FROM vitrina_reports GROUP BY date ORDER BY date"
+        )
+        vitrina_days = await cursor.fetchall()
+        cursor = await db.execute("SELECT COUNT(*) FROM vitrina_reports")
+        vitrina_total = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT date, COUNT(*) FROM shift_events GROUP BY date ORDER BY date"
+        )
+        shift_days = await cursor.fetchall()
+        cursor = await db.execute("SELECT COUNT(*) FROM shift_events")
+        shift_total = (await cursor.fetchone())[0]
+
+    vitrina_dates = ", ".join(d for d, _ in vitrina_days) or "—"
+    shift_dates = ", ".join(d for d, _ in shift_days) or "—"
+    return (
+        f"Файл: `{DB_PATH}` ({size_kb} KB)\n"
+        f"Витрины: {vitrina_total} записей ({len(vitrina_days)} дн.)\n"
+        f"Даты витрин: {vitrina_dates}\n"
+        f"Выходы: {shift_total} записей ({len(shift_days)} дн.)\n"
+        f"Даты выходов: {shift_dates}"
+    )
+
+
+def prune_local_backups(keep: int = BACKUP_KEEP_LOCAL) -> None:
+    if not os.path.isdir(BACKUP_DIR):
+        return
+    files = sorted(
+        (
+            os.path.join(BACKUP_DIR, name)
+            for name in os.listdir(BACKUP_DIR)
+            if name.endswith(".db")
+        ),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for path in files[keep:]:
+        try:
+            os.remove(path)
+        except OSError:
+            logger.exception("Не удалось удалить старый бэкап: %s", path)
+
+
+async def create_db_backup_file(prefix: str = "vitrina_backup") -> str | None:
+    if not os.path.isfile(DB_PATH):
+        return None
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = now_msk().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(BACKUP_DIR, f"{prefix}_{stamp}.db")
+    async with aiosqlite.connect(DB_PATH) as src:
+        async with aiosqlite.connect(backup_path) as dst:
+            await src.backup(dst)
+    prune_local_backups()
+    return backup_path
+
+
+async def backup_database_to_admins(reason: str) -> bool:
+    backup_path = await create_db_backup_file()
+    if not backup_path:
+        logger.warning("Бэкап пропущен: файл базы не найден (%s)", DB_PATH)
+        return False
+
+    summary = await fetch_db_summary()
+    caption = f"💾 **Бэкап базы** ({reason})\n\n{summary}"
+    admin_ids = await fetch_admin_ids()
+    if not admin_ids:
+        logger.warning("Бэкап создан локально, но нет админов для отправки")
+        return True
+
+    sent = 0
+    for user_id in admin_ids:
+        try:
+            await send_admin_dm(
+                user_id,
+                caption,
+                parse_mode="Markdown",
+            )
+            await bot.send_document(
+                user_id,
+                FSInputFile(backup_path),
+                caption=f"Файл: {os.path.basename(backup_path)}",
+            )
+            sent += 1
+        except Exception:
+            logger.exception("Не удалось отправить бэкап админу %s", user_id)
+
+    logger.info("Бэкап (%s): %s, отправлено %d админам", reason, backup_path, sent)
+    return True
+
+
+async def restore_database_from_file(source_path: str) -> str:
+    async with aiosqlite.connect(source_path) as db:
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='vitrina_reports'"
+        )
+        if not await cursor.fetchone():
+            raise ValueError("В файле нет таблицы vitrina_reports")
+
+    setup_db_location()
+    if os.path.isfile(DB_PATH):
+        await create_db_backup_file(prefix="before_restore")
+
+    shutil.copy2(source_path, DB_PATH)
+    await init_db()
+    return await fetch_db_summary()
+
+
+_last_daily_backup_date: str | None = None
+_last_interval_backup_key: str | None = None
+
+
+async def maybe_run_scheduled_backup(now: datetime) -> None:
+    global _last_daily_backup_date, _last_interval_backup_key
+
+    today = now.strftime("%Y-%m-%d")
+    if now.hour == 23 and now.minute >= 55 and _last_daily_backup_date != today:
+        _last_daily_backup_date = today
+        await backup_database_to_admins("ежедневный")
+
+    interval_key = f"{today}-{now.hour // 6}"
+    if now.minute == 0 and _last_interval_backup_key != interval_key:
+        _last_interval_backup_key = interval_key
+        await create_db_backup_file(prefix="auto")
+
+
 async def init_db() -> None:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    setup_db_location()
+    await import_legacy_db_if_needed()
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """CREATE TABLE IF NOT EXISTS vitrina_reports (
             id INTEGER PRIMARY KEY,
@@ -333,7 +496,7 @@ async def fetch_reports_for_dates(dates: list[str]) -> dict[tuple[str, str, str]
     if not dates:
         return {}
     placeholders = ",".join("?" * len(dates))
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT date, point, time_slot, username, message_time, status, has_photo
@@ -348,7 +511,7 @@ async def fetch_shifts_for_dates(dates: list[str]) -> list[dict]:
     if not dates:
         return []
     placeholders = ",".join("?" * len(dates))
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT date, point, user_id, username, event_type, event_time, event_label
@@ -361,7 +524,7 @@ async def fetch_shifts_for_dates(dates: list[str]) -> list[dict]:
 
 
 async def is_slot_notified(date: str, time_slot: str) -> bool:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT 1 FROM slot_notifications WHERE date=? AND time_slot=?",
             (date, time_slot),
@@ -370,7 +533,7 @@ async def is_slot_notified(date: str, time_slot: str) -> bool:
 
 
 async def mark_slot_notified(date: str, time_slot: str) -> None:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO slot_notifications (date, time_slot) VALUES (?, ?)",
             (date, time_slot),
@@ -379,14 +542,14 @@ async def mark_slot_notified(date: str, time_slot: str) -> None:
 
 
 async def load_admins() -> set[int]:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT user_id FROM admins")
         rows = await cursor.fetchall()
     return {row[0] for row in rows}
 
 
 async def save_admin(user_id: int, username: str | None) -> None:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO admins (user_id, username, added_at)
                VALUES (?, ?, ?)
@@ -397,7 +560,7 @@ async def save_admin(user_id: int, username: str | None) -> None:
 
 
 async def fetch_admin_ids() -> list[int]:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT user_id FROM admins")
         rows = await cursor.fetchall()
     return [row[0] for row in rows]
@@ -515,7 +678,7 @@ async def save_shift_event(
     event_label: str,
 ) -> None:
     created_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO shift_events
                (date, point, user_id, username, event_type, event_time, event_label, created_at)
@@ -687,6 +850,7 @@ def build_admin_keyboard(manual_mode: bool = False) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📊 Отчёт")],
         [KeyboardButton(text="📋 Статус сегодня")],
         [KeyboardButton(text="✏️ Внести витрину")],
+        [KeyboardButton(text="💾 Бэкап базы")],
     ]
     if manual_mode:
         rows.append([KeyboardButton(text="❌ Отмена")])
@@ -758,7 +922,7 @@ async def save_manual_vitrina(
     time_slot: str,
     username: str,
 ) -> None:
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "DELETE FROM vitrina_reports WHERE date=? AND point=? AND time_slot=?",
             (date, point, time_slot),
@@ -776,7 +940,9 @@ def admin_welcome_text() -> str:
     return (
         "🔐 **Админ-панель**\n\n"
         "Выберите действие кнопкой ниже.\n"
-        "Отчёты приходят сюда, в личные сообщения."
+        "Отчёты приходят сюда, в личные сообщения.\n\n"
+        "💾 Бэкап базы — копия файла сюда в ЛС.\n"
+        "Чтобы восстановить базу — отправьте файл `.db` в этот чат."
     )
 
 
@@ -1082,7 +1248,9 @@ async def check_missed_vitrinas() -> None:
 async def notification_scheduler() -> None:
     while True:
         try:
+            now = now_msk()
             await check_missed_vitrinas()
+            await maybe_run_scheduled_backup(now)
         except Exception:
             logger.exception("Ошибка в планировщике уведомлений")
         await asyncio.sleep(60)
@@ -1138,7 +1306,7 @@ async def handle_work_chat_message(message: Message):
     message_time = now_msk().strftime("%H:%M")
     status = get_submission_status(time_slot, message_time)
 
-    async with aiosqlite.connect("vitrina_bot.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "DELETE FROM vitrina_reports WHERE date=? AND point=? AND time_slot=?",
             (date, point, time_slot),
@@ -1288,10 +1456,60 @@ async def handle_private_message(message: Message):
         )
         return
 
+    if text == "💾 Бэкап базы":
+        ok = await backup_database_to_admins("по запросу")
+        if ok:
+            await message.answer(
+                "✅ Бэкап создан и отправлен в этот чат.",
+                reply_markup=build_admin_keyboard(),
+            )
+        else:
+            await message.answer(
+                "⚠️ База пуста или файл не найден.",
+                reply_markup=build_admin_keyboard(),
+            )
+        return
+
     await message.answer(
         "Используйте кнопки ниже 👇",
         reply_markup=build_admin_keyboard(),
     )
+
+
+@dp.message(F.chat.type == "private", F.document)
+async def handle_admin_db_restore(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    doc = message.document
+    filename = (doc.file_name or "").lower()
+    if not filename.endswith(".db"):
+        return
+
+    temp_path = os.path.join(BACKUP_DIR, f"upload_{message.from_user.id}_{now_msk().strftime('%Y%m%d_%H%M%S')}.db")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    try:
+        tg_file = await bot.get_file(doc.file_id)
+        await bot.download_file(tg_file.file_path, destination=temp_path)
+        summary = await restore_database_from_file(temp_path)
+        await message.answer(
+            "✅ **База восстановлена из файла**\n\n" + summary,
+            parse_mode="Markdown",
+            reply_markup=build_admin_keyboard(),
+        )
+        logger.info("База восстановлена админом %s из %s", message.from_user.id, filename)
+    except Exception as exc:
+        logger.exception("Ошибка восстановления базы")
+        await message.answer(
+            f"❌ Не удалось восстановить базу: {exc}",
+            reply_markup=build_admin_keyboard(),
+        )
+    finally:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
 
 
 @dp.callback_query(F.data.startswith("adm:"))
@@ -1457,10 +1675,14 @@ async def main():
     print("=== VITRINA BOT: старт ===", flush=True)
     print(f"=== TOKEN: {'задан' if TOKEN else 'НЕТ'} ===", flush=True)
     print(f"=== WORK_CHAT_ID: {WORK_CHAT_ID} ===", flush=True)
+    print(f"=== DB_PATH: {DB_PATH} ===", flush=True)
 
     await init_db()
     authenticated_admins.update(await load_admins())
     logger.info("Админов в базе: %d", len(authenticated_admins))
+    logger.info("База данных: %s", DB_PATH)
+    logger.info("Сводка базы:\n%s", await fetch_db_summary())
+    await create_db_backup_file(prefix="startup")
     logger.info("Бот запущен. Слоты (МСК): %s", ", ".join(TIMES))
     logger.info("Рабочий чат: chat_id=%s", WORK_CHAT_ID)
     print("=== VITRINA BOT: polling... ===", flush=True)
