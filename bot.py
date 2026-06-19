@@ -72,11 +72,15 @@ FINE_AMOUNT = 500
 ARRIVAL_KEYWORDS = (
     "ПРИШЕЛ", "ПРИШЛА", "ПРИХОД", "ПРИБЫЛ", "ПРИБЫЛА",
     "НА ТОЧКЕ", "ЗАШЕЛ", "ЗАШЛА", "НАЧАЛ", "НА РАБОТЕ",
+    "ВЕРНУЛСЯ", "ВЕРНУЛАСЬ", "ВЕРНУЛСЬ", "ВЕРНУЛС",
 )
 DEPARTURE_KEYWORDS = (
     "ВЫШЕЛ", "ВЫШЛА", "УШЕЛ", "УШЛА", "ЗАКОНЧИЛ", "КОНЕЦ", "УХОД",
     "ВЫХОД", "С ТОЧКИ", "СО СМЕНЫ", "СМЕНА ЗАКОНЧ",
+    "ОТОШЕЛ", "ОТОШОЛ", "ОТОШЛА", "ОТОШ",
 )
+RETURN_KEYWORDS = ("ВЕРНУЛСЯ", "ВЕРНУЛАСЬ", "ВЕРНУЛСЬ", "ВЕРНУЛС")
+STEP_OUT_KEYWORDS = ("ОТОШЕЛ", "ОТОШОЛ", "ОТОШЛА", "ОТОШ")
 
 MONTH_NAMES = [
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -232,14 +236,15 @@ async def init_db() -> None:
         )
         await db.execute(
             """CREATE TABLE IF NOT EXISTS shift_events (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT,
             point TEXT,
             user_id INTEGER,
             username TEXT,
             event_type TEXT,
             event_time TEXT,
-            UNIQUE(date, point, user_id, event_type)
+            event_label TEXT,
+            created_at TEXT
         )"""
         )
         await db.execute(
@@ -268,7 +273,60 @@ async def init_db() -> None:
             )
         except aiosqlite.OperationalError:
             pass
+        await migrate_shift_events(db)
         await db.commit()
+
+
+async def migrate_shift_events(db: aiosqlite.Connection) -> None:
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='shift_events'"
+    )
+    row = await cursor.fetchone()
+    if not row or not row[0]:
+        return
+
+    table_sql = row[0]
+    if "UNIQUE(date, point, user_id, event_type)" not in table_sql:
+        try:
+            await db.execute(
+                "ALTER TABLE shift_events ADD COLUMN event_label TEXT DEFAULT ''"
+            )
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE shift_events ADD COLUMN created_at TEXT DEFAULT ''"
+            )
+        except aiosqlite.OperationalError:
+            pass
+        return
+
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS shift_events_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            point TEXT,
+            user_id INTEGER,
+            username TEXT,
+            event_type TEXT,
+            event_time TEXT,
+            event_label TEXT,
+            created_at TEXT
+        )"""
+    )
+    await db.execute(
+        """INSERT INTO shift_events_new
+           (date, point, user_id, username, event_type, event_time, event_label, created_at)
+           SELECT date, point, user_id, username, event_type, event_time,
+                  CASE WHEN event_type = 'arrival' THEN 'пришёл' ELSE 'ушёл' END,
+                  date || ' ' || event_time
+           FROM shift_events"""
+    )
+    await db.execute("DROP TABLE shift_events")
+    await db.execute("ALTER TABLE shift_events_new RENAME TO shift_events")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shifts_date ON shift_events(date)"
+    )
 
 
 async def fetch_reports_for_dates(dates: list[str]) -> dict[tuple[str, str, str], dict]:
@@ -293,9 +351,9 @@ async def fetch_shifts_for_dates(dates: list[str]) -> list[dict]:
     async with aiosqlite.connect("vitrina_bot.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            f"""SELECT date, point, user_id, username, event_type, event_time
+            f"""SELECT date, point, user_id, username, event_type, event_time, event_label
                 FROM shift_events WHERE date IN ({placeholders})
-                ORDER BY date, point, event_time""",
+                ORDER BY date, point, created_at, id, event_time""",
             dates,
         )
         rows = await cursor.fetchall()
@@ -371,10 +429,11 @@ async def notify_admins_shift(
     event: str,
     event_time: str,
     username: str,
+    event_label: str,
 ) -> None:
-    verb = "Приход" if event == "arrival" else "Уход"
+    kind = "Приход" if event == "arrival" else "Уход"
     text = (
-        f"👥 **{verb} на точке {point}**\n"
+        f"👥 **{kind} на точке {point}** ({event_label})\n"
         f"Сотрудник: {username}\n"
         f"Время: {event_time}\n"
         f"Дата: {get_today()}"
@@ -409,30 +468,69 @@ async def notify_admins_vitrina(
 
 
 # ====================== ПАРСЕР ======================
-def parse_shift_message(text: str) -> tuple[str | None, str | None, str | None]:
-    text_upper = normalize_caption(text).upper()
-    event = None
+def build_message_text_with_reply(message: Message) -> str:
+    text = (message.text or message.caption or "").strip()
+    if not message.reply_to_message:
+        return text
+    reply = message.reply_to_message
+    reply_text = (reply.text or reply.caption or "").strip()
+    if not reply_text:
+        return text
+    return f"{reply_text} {text}".strip()
+
+
+def classify_shift_event(text_upper: str) -> tuple[str | None, str | None]:
+    if any(k in text_upper for k in RETURN_KEYWORDS):
+        return "arrival", "вернулся"
+    if any(k in text_upper for k in STEP_OUT_KEYWORDS):
+        return "departure", "отошёл"
     if any(k in text_upper for k in ARRIVAL_KEYWORDS):
-        event = "arrival"
-    elif any(k in text_upper for k in DEPARTURE_KEYWORDS):
-        event = "departure"
+        return "arrival", "пришёл"
+    if any(k in text_upper for k in DEPARTURE_KEYWORDS):
+        return "departure", "ушёл"
+    return None, None
+
+
+def parse_shift_message(text: str) -> tuple[str | None, str | None, str | None, str | None]:
+    text_upper = normalize_caption(text).upper()
+    event, event_label = classify_shift_event(text_upper)
     if not event:
-        return None, None, None
+        return None, None, None, None
 
     point = find_point(text_upper)
     if not point:
-        return None, None, None
+        return None, None, None, None
 
     event_time = parse_time_from_text(text_upper) or now_msk().strftime("%H:%M")
-    return point, event, event_time
+    return point, event, event_time, event_label
 
 
-def collect_shift_rows(
+async def save_shift_event(
+    date: str,
+    point: str,
+    user_id: int,
+    username: str,
+    event: str,
+    event_time: str,
+    event_label: str,
+) -> None:
+    created_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        await db.execute(
+            """INSERT INTO shift_events
+               (date, point, user_id, username, event_type, event_time, event_label, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (date, point, user_id, username, event, event_time, event_label, created_at),
+        )
+        await db.commit()
+
+
+def collect_shift_event_lines(
     dates: list[str],
     shifts: list[dict],
-) -> list[tuple[str, str, str, str | None, str | None]]:
-    """date, point, username, arrival_time, departure_time"""
-    rows: list[tuple[str, str, str, str | None, str | None]] = []
+) -> list[tuple[str, str, str, str, str]]:
+    """date, point, username, event_label, event_time"""
+    lines: list[tuple[str, str, str, str, str]] = []
     for date in sorted(dates):
         day_events = [s for s in shifts if s["date"] == date]
         by_point: dict[str, list[dict]] = {}
@@ -440,41 +538,31 @@ def collect_shift_rows(
             by_point.setdefault(ev["point"], []).append(ev)
 
         for point in POINTS:
-            events = by_point.get(point, [])
-            if not events:
-                continue
-            user_ids = {e["user_id"] for e in events}
-            for user_id in user_ids:
-                arrival = next(
-                    (e for e in events if e["user_id"] == user_id and e["event_type"] == "arrival"),
-                    None,
+            for ev in by_point.get(point, []):
+                label = ev.get("event_label") or (
+                    "пришёл" if ev["event_type"] == "arrival" else "ушёл"
                 )
-                departure = next(
-                    (e for e in events if e["user_id"] == user_id and e["event_type"] == "departure"),
-                    None,
-                )
-                username = (arrival or departure)["username"]
-                rows.append((
+                lines.append((
                     date,
                     point,
-                    username,
-                    arrival["event_time"] if arrival else None,
-                    departure["event_time"] if departure else None,
+                    ev["username"],
+                    label,
+                    ev["event_time"],
                 ))
-    return rows
+    return lines
 
 
 def build_shift_text_blocks(
     dates: list[str],
     shifts: list[dict],
 ) -> list[str]:
-    rows = collect_shift_rows(dates, shifts)
-    if not rows:
+    lines = collect_shift_event_lines(dates, shifts)
+    if not lines:
         return ["\n👥 **ВЫХОДЫ СОТРУДНИКОВ**\n\nНет данных о выходах"]
 
     blocks = ["\n👥 **ВЫХОДЫ СОТРУДНИКОВ**"]
-    by_date: dict[str, list[tuple[str, str, str, str | None, str | None]]] = {}
-    for row in rows:
+    by_date: dict[str, list[tuple[str, str, str, str, str]]] = {}
+    for row in lines:
         by_date.setdefault(row[0], []).append(row)
 
     for date in sorted(by_date.keys()):
@@ -484,15 +572,10 @@ def build_shift_text_blocks(
             point_rows = [r for r in date_rows if r[1] == point]
             if not point_rows:
                 continue
-            lines = [f"**Точка: {point}**"]
-            for _, _, username, arr_time, dep_time in point_rows:
-                if arr_time and dep_time:
-                    lines.append(f"  • {username} — пришёл {arr_time}, вышел {dep_time}")
-                elif arr_time:
-                    lines.append(f"  • {username} — пришёл {arr_time}")
-                elif dep_time:
-                    lines.append(f"  • {username} — вышел {dep_time}")
-            blocks.append("\n".join(lines))
+            point_lines = [f"**Точка: {point}**"]
+            for _, _, username, label, event_time in point_rows:
+                point_lines.append(f"  • {username} — {label} {event_time}")
+            blocks.append("\n".join(point_lines))
 
     return blocks
 
@@ -599,14 +682,94 @@ def is_admin(user_id: int) -> bool:
     return user_id in authenticated_admins
 
 
-def build_admin_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Отчёт")],
-            [KeyboardButton(text="📋 Статус сегодня")],
-        ],
-        resize_keyboard=True,
+def build_admin_keyboard(manual_mode: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="📊 Отчёт")],
+        [KeyboardButton(text="📋 Статус сегодня")],
+        [KeyboardButton(text="✏️ Внести витрину")],
+    ]
+    if manual_mode:
+        rows.append([KeyboardButton(text="❌ Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def manual_vitrina_help_text() -> str:
+    return (
+        "✏️ **Ручной ввод витрины**\n\n"
+        "Отправьте **одной строкой**:\n"
+        "`дата точка время имя`\n\n"
+        "**Примеры:**\n"
+        "• `2026-06-15 МН 10:00 Иван`\n"
+        "• `15.06.2026 СМ 16 Мария`\n"
+        "• `2026-06-15 ПТ 20:00 @ivanov`\n\n"
+        "Если запись за этот день/точку/слот уже есть — она **заменится**.\n"
+        "Для отмены нажмите **❌ Отмена**."
     )
+
+
+def parse_manual_vitrina(text: str) -> tuple[str, str, str, str] | None:
+    """date, point, time_slot, username"""
+    text = text.strip()
+    match = re.match(
+        r"^(?:(\d{4}-\d{2}-\d{2})|(\d{1,2})\.(\d{1,2})\.(\d{4}))\s+"
+        r"(.+?)\s+"
+        r"(\d{1,2})(?::(\d{2}))?\s+"
+        r"(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    if match.group(1):
+        date = match.group(1)
+    else:
+        date = (
+            f"{match.group(4)}-{int(match.group(3)):02d}-{int(match.group(2)):02d}"
+        )
+
+    point_raw = match.group(5).upper()
+    point = find_point(point_raw) or find_point(f" {point_raw} ")
+    if not point:
+        for p in POINTS:
+            if point_raw == p.upper():
+                point = p
+                break
+    if not point:
+        return None
+
+    hour = int(match.group(6))
+    slot = f"{hour:02d}:00"
+    if slot not in TIMES:
+        return None
+    if slot == "20:00" and point in NO_EVENING_POINTS:
+        return None
+
+    username = match.group(8).strip().lstrip("@")
+    if not username:
+        return None
+
+    return date, point, slot, username
+
+
+async def save_manual_vitrina(
+    date: str,
+    point: str,
+    time_slot: str,
+    username: str,
+) -> None:
+    async with aiosqlite.connect("vitrina_bot.db") as db:
+        await db.execute(
+            "DELETE FROM vitrina_reports WHERE date=? AND point=? AND time_slot=?",
+            (date, point, time_slot),
+        )
+        await db.execute(
+            """INSERT INTO vitrina_reports
+               (date, point, time_slot, user_id, username, message_time, status, has_photo)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (date, point, time_slot, 0, username, time_slot, "on_time", 1),
+        )
+        await db.commit()
 
 
 def admin_welcome_text() -> str:
@@ -652,6 +815,7 @@ def get_admin_session(user_id: int) -> dict:
             "dates": set(),
             "year": now.year,
             "month": now.month,
+            "mode": None,
         }
     return admin_sessions[user_id]
 
@@ -851,19 +1015,13 @@ async def generate_report_xlsx(
 
     # --- Лист: выходы ---
     ws2 = wb.create_sheet("Выходы")
-    ws2.append(["Дата", "Точка", "Сотрудник", "Пришёл", "Вышел"])
+    ws2.append(["Дата", "Точка", "Сотрудник", "Событие", "Время"])
     for cell in ws2[1]:
         cell.fill = header_fill
         cell.font = header_font
 
-    for date, point, username, arr_time, dep_time in collect_shift_rows(dates, shifts):
-        ws2.append([
-            date,
-            point,
-            username,
-            arr_time or "—",
-            dep_time or "—",
-        ])
+    for date, point, username, label, event_time in collect_shift_event_lines(dates, shifts):
+        ws2.append([date, point, username, label, event_time])
 
     if ws2.max_row == 1:
         ws2.append(["—", "—", "Нет данных", "—", "—"])
@@ -941,34 +1099,29 @@ class WorkChatFilter(BaseFilter):
     (F.text & ~F.text.startswith("/")) | (F.caption & ~F.caption.startswith("/")),
 )
 async def handle_work_chat_message(message: Message):
-    text = (message.text or message.caption or "").strip()
+    text = build_message_text_with_reply(message)
     if not text or text.split()[0] == ADMIN_CODE:
         return
 
     has_photo = bool(message.photo)
 
-    point, event, event_time = parse_shift_message(text)
+    point, event, event_time, event_label = parse_shift_message(text)
     if point and event:
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.full_name
         date = get_today()
-        async with aiosqlite.connect("vitrina_bot.db") as db:
-            await db.execute(
-                """INSERT INTO shift_events
-                   (date, point, user_id, username, event_type, event_time)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(date, point, user_id, event_type)
-                   DO UPDATE SET event_time=excluded.event_time,
-                                 username=excluded.username""",
-                (date, point, user_id, username, event, event_time),
-            )
-            await db.commit()
+        await save_shift_event(
+            date, point, user_id, username, event, event_time, event_label or "",
+        )
 
         logger.info(
-            "Выход: %s %s %s (%s) user=%s",
-            date, point, event, event_time, user_id,
+            "Выход: %s %s %s %s (%s) user=%s reply=%s",
+            date, point, event, event_label, event_time, user_id,
+            bool(message.reply_to_message),
         )
-        await notify_admins_shift(point, event, event_time, username)
+        await notify_admins_shift(
+            point, event, event_time, username, event_label or "",
+        )
         return
 
     point, time_slot = parse_vitrina_message(text)
@@ -1076,6 +1229,51 @@ async def handle_private_message(message: Message):
 
     if not is_admin(user_id):
         await message.answer("🔒 Введите код администратора для доступа к панели.")
+        return
+
+    session = get_admin_session(user_id)
+
+    if text == "❌ Отмена":
+        session["mode"] = None
+        await message.answer(
+            "Ввод отменён.",
+            reply_markup=build_admin_keyboard(),
+        )
+        return
+
+    if text == "✏️ Внести витрину":
+        session["mode"] = "manual_vitrina"
+        await message.answer(
+            manual_vitrina_help_text(),
+            parse_mode="Markdown",
+            reply_markup=build_admin_keyboard(manual_mode=True),
+        )
+        return
+
+    if session.get("mode") == "manual_vitrina":
+        parsed = parse_manual_vitrina(text)
+        if not parsed:
+            await message.answer(
+                "Не удалось разобрать строку.\n\n" + manual_vitrina_help_text(),
+                parse_mode="Markdown",
+                reply_markup=build_admin_keyboard(manual_mode=True),
+            )
+            return
+
+        date, point, time_slot, username = parsed
+        await save_manual_vitrina(date, point, time_slot, username)
+        session["mode"] = None
+        logger.info(
+            "Ручной ввод витрины: %s %s %s %s admin=%s",
+            date, point, time_slot, username, user_id,
+        )
+        await message.answer(
+            f"✅ Записано:\n"
+            f"**{date}** — **{point}** — **{time_slot}**\n"
+            f"Сотрудник: {username}",
+            parse_mode="Markdown",
+            reply_markup=build_admin_keyboard(),
+        )
         return
 
     if text == "📊 Отчёт":
