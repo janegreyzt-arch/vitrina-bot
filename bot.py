@@ -73,6 +73,8 @@ SLOT_WINDOWS = {
 }
 SLOT_END = {slot: window[1] for slot, window in SLOT_WINDOWS.items()}
 NO_EVENING_POINTS = ["МСТИЛЬ", "СОК"]
+WEEKEND_CLOSED_POINTS = ["МСТИЛЬ"]
+WEEKEND_NO_EVENING_POINTS = ["СОК", "МН", "ПК", "СМ"]
 
 ADMIN_CODE = "1506"
 FINE_AMOUNT = 500
@@ -117,14 +119,23 @@ def parse_date(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=MSK)
 
 
-def slots_for_point(point: str) -> list[str]:
-    if point in NO_EVENING_POINTS:
-        return [t for t in TIMES if t != "20:00"]
-    return TIMES
+def is_weekend(date: str) -> bool:
+    return parse_date(date).weekday() >= 5
+
+
+def is_vitrina_required(date: str, point: str, slot: str) -> bool:
+    if is_weekend(date) and point in WEEKEND_CLOSED_POINTS:
+        return False
+    if slot == "20:00":
+        if point in NO_EVENING_POINTS:
+            return False
+        if is_weekend(date) and point in WEEKEND_NO_EVENING_POINTS:
+            return False
+    return True
 
 
 def required_slots_for_date(date: str, point: str) -> list[str]:
-    return slots_for_point(point)
+    return [slot for slot in TIMES if is_vitrina_required(date, point, slot)]
 
 
 def get_current_time_slot(now: datetime | None = None) -> str:
@@ -762,7 +773,7 @@ def parse_vitrina_message(text: str) -> tuple[str | None, str | None]:
     if not is_vitrina_format(text_upper, point):
         return None, None
 
-    if time_slot == "20:00" and point in NO_EVENING_POINTS:
+    if not is_vitrina_required(get_today(), point, time_slot):
         return point, None
 
     return point, time_slot
@@ -906,7 +917,7 @@ def parse_manual_vitrina(text: str) -> tuple[str, str, str, str] | None:
     slot = f"{hour:02d}:00"
     if slot not in TIMES:
         return None
-    if slot == "20:00" and point in NO_EVENING_POINTS:
+    if not is_vitrina_required(date, point, slot):
         return None
 
     username = match.group(8).strip().lstrip("@")
@@ -1159,7 +1170,7 @@ async def generate_report_xlsx(
         for point in POINTS:
             row = [date, point]
             for slot in TIMES:
-                if slot == "20:00" and point in NO_EVENING_POINTS:
+                if not is_vitrina_required(date, point, slot):
                     row.extend(["—", "—", "не требуется"])
                     continue
                 report = reports.get((date, point, slot))
@@ -1227,7 +1238,7 @@ async def check_missed_vitrinas() -> None:
         reports = await fetch_reports_for_dates([today])
         missed: list[str] = []
         for point in POINTS:
-            if slot == "20:00" and point in NO_EVENING_POINTS:
+            if not is_vitrina_required(today, point, slot):
                 continue
             report = reports.get((today, point, slot))
             if not report or not report.get("has_photo"):
